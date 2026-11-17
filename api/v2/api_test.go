@@ -1,0 +1,1636 @@
+// Copyright 2019 Prometheus Team
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package v2
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/go-openapi/runtime"
+	"github.com/go-openapi/runtime/middleware"
+	"github.com/go-openapi/strfmt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/prometheus/alertmanager/alert"
+	"github.com/prometheus/alertmanager/api/metrics"
+	open_api_models "github.com/prometheus/alertmanager/api/v2/models"
+	alert_ops "github.com/prometheus/alertmanager/api/v2/restapi/operations/alert"
+	alertgroup_ops "github.com/prometheus/alertmanager/api/v2/restapi/operations/alertgroup"
+	general_ops "github.com/prometheus/alertmanager/api/v2/restapi/operations/general"
+	receiver_ops "github.com/prometheus/alertmanager/api/v2/restapi/operations/receiver"
+	silence_ops "github.com/prometheus/alertmanager/api/v2/restapi/operations/silence"
+	"github.com/prometheus/alertmanager/config"
+	"github.com/prometheus/alertmanager/dispatch"
+	"github.com/prometheus/alertmanager/eventrecorder"
+	"github.com/prometheus/alertmanager/featurecontrol"
+	"github.com/prometheus/alertmanager/labelset"
+	"github.com/prometheus/alertmanager/marker"
+	"github.com/prometheus/alertmanager/matcher/compat"
+	"github.com/prometheus/alertmanager/pkg/labels"
+	"github.com/prometheus/alertmanager/provider"
+	"github.com/prometheus/alertmanager/provider/mem"
+	"github.com/prometheus/alertmanager/silence"
+	"github.com/prometheus/alertmanager/silence/silencepb"
+)
+
+// If api.peers == nil, Alertmanager cluster feature is disabled. Make sure to
+// not try to access properties of peer, which would trigger a nil pointer
+// dereference.
+func TestGetStatusHandlerWithNilPeer(t *testing.T) {
+	api := API{
+		uptime:             time.Now(),
+		peer:               nil,
+		alertmanagerConfig: &config.Config{},
+	}
+
+	// Test ensures this method call does not panic.
+	status := api.getStatusHandler(
+		general_ops.GetStatusParams{
+			HTTPRequest: httptest.NewRequest(
+				"GET",
+				"/api/v2/status",
+				nil,
+			),
+		},
+	).(*general_ops.GetStatusOK)
+
+	c := status.Payload.Cluster
+
+	if c == nil || c.Status == nil {
+		t.Fatal("expected cluster status not to be nil, violating the openapi specification")
+	}
+
+	if c.Peers == nil {
+		t.Fatal("expected cluster peers to be not nil when api.peer is nil, violating the openapi specification")
+	}
+	if len(c.Peers) != 0 {
+		t.Fatal("expected cluster peers to be empty when api.peer is nil, violating the openapi specification")
+	}
+
+	if c.Name != "" {
+		t.Fatal("expected cluster name to be empty, violating the openapi specification")
+	}
+}
+
+func assertEqualStrings(t *testing.T, expected, actual string) {
+	if expected != actual {
+		t.Fatal("expected: ", expected, ", actual: ", actual)
+	}
+}
+
+var (
+	testComment = "comment"
+	createdBy   = "test"
+)
+
+func newSilences(t *testing.T) *silence.Silences {
+	silences, err := silence.New(silence.Options{Metrics: prometheus.NewRegistry()})
+	require.NoError(t, err)
+
+	return silences
+}
+
+func gettableSilence(id, state string,
+	updatedAt, start, end string,
+) *open_api_models.GettableSilence {
+	updAt, err := strfmt.ParseDateTime(updatedAt)
+	if err != nil {
+		panic(err)
+	}
+	strAt, err := strfmt.ParseDateTime(start)
+	if err != nil {
+		panic(err)
+	}
+	endAt, err := strfmt.ParseDateTime(end)
+	if err != nil {
+		panic(err)
+	}
+	return &open_api_models.GettableSilence{
+		Silence: open_api_models.Silence{
+			StartsAt:  &strAt,
+			EndsAt:    &endAt,
+			Comment:   &testComment,
+			CreatedBy: &createdBy,
+		},
+		ID:        &id,
+		UpdatedAt: &updAt,
+		Status: &open_api_models.SilenceStatus{
+			State: &state,
+		},
+	}
+}
+
+func TestGetSilencesHandler(t *testing.T) {
+	updateTime := "2019-01-01T12:00:00+00:00"
+	silences := []*open_api_models.GettableSilence{
+		gettableSilence("silence-6-expired", "expired", updateTime,
+			"2019-01-01T12:00:00+00:00", "2019-01-01T11:00:00+00:00"),
+		gettableSilence("silence-1-active", "active", updateTime,
+			"2019-01-01T12:00:00+00:00", "2019-01-01T13:00:00+00:00"),
+		gettableSilence("silence-7-expired", "expired", updateTime,
+			"2019-01-01T12:00:00+00:00", "2019-01-01T10:00:00+00:00"),
+		gettableSilence("silence-5-expired", "expired", updateTime,
+			"2019-01-01T12:00:00+00:00", "2019-01-01T12:00:00+00:00"),
+		gettableSilence("silence-0-active", "active", updateTime,
+			"2019-01-01T12:00:00+00:00", "2019-01-01T12:00:00+00:00"),
+		gettableSilence("silence-4-pending", "pending", updateTime,
+			"2019-01-01T13:00:00+00:00", "2019-01-01T12:00:00+00:00"),
+		gettableSilence("silence-3-pending", "pending", updateTime,
+			"2019-01-01T12:00:00+00:00", "2019-01-01T12:00:00+00:00"),
+		gettableSilence("silence-2-active", "active", updateTime,
+			"2019-01-01T12:00:00+00:00", "2019-01-01T14:00:00+00:00"),
+	}
+	SortSilences(open_api_models.GettableSilences(silences))
+
+	for i, sil := range silences {
+		assertEqualStrings(t, "silence-"+strconv.Itoa(i)+"-"+*sil.Status.State, *sil.ID)
+	}
+}
+
+func TestGetSilencesHandlerStateFilter(t *testing.T) {
+	now := timestamppb.Now()
+	silences := newSilences(t)
+	m := &silencepb.Matcher{Type: silencepb.Matcher_EQUAL, Name: "a", Pattern: "b"}
+
+	// active silence: starts in the past, ends in the future.
+	activeSil := &silencepb.Silence{
+		MatcherSets: []*silencepb.MatcherSet{{Matchers: []*silencepb.Matcher{m}}},
+		StartsAt:    timestamppb.New(now.AsTime().Add(-time.Hour)),
+		EndsAt:      timestamppb.New(now.AsTime().Add(time.Hour)),
+		UpdatedAt:   now,
+	}
+	require.NoError(t, silences.Set(t.Context(), activeSil))
+
+	// pending silence: starts in the future.
+	pendingSil := &silencepb.Silence{
+		MatcherSets: []*silencepb.MatcherSet{{Matchers: []*silencepb.Matcher{m}}},
+		StartsAt:    timestamppb.New(now.AsTime().Add(time.Hour)),
+		EndsAt:      timestamppb.New(now.AsTime().Add(2 * time.Hour)),
+		UpdatedAt:   now,
+	}
+	require.NoError(t, silences.Set(t.Context(), pendingSil))
+
+	// expired silence: explicitly expired via Expire().
+	expiredSil := &silencepb.Silence{
+		MatcherSets: []*silencepb.MatcherSet{{Matchers: []*silencepb.Matcher{m}}},
+		StartsAt:    timestamppb.New(now.AsTime().Add(-time.Hour)),
+		EndsAt:      timestamppb.New(now.AsTime().Add(time.Hour)),
+		UpdatedAt:   now,
+	}
+	require.NoError(t, silences.Set(t.Context(), expiredSil))
+	require.NoError(t, silences.Expire(t.Context(), expiredSil.Id))
+
+	api := API{
+		uptime:   time.Now(),
+		silences: silences,
+		logger:   promslog.NewNopLogger(),
+	}
+
+	callHandler := func(active, expired, pending *bool) []*open_api_models.GettableSilence {
+		r, err := http.NewRequest("GET", "/api/v2/silences", nil)
+		require.NoError(t, err)
+		w := httptest.NewRecorder()
+		p := runtime.TextProducer()
+		responder := api.getSilencesHandler(silence_ops.GetSilencesParams{
+			HTTPRequest: r,
+			Active:      active,
+			Expired:     expired,
+			Pending:     pending,
+		})
+		responder.WriteResponse(w, p)
+		require.Equal(t, http.StatusOK, w.Code)
+		var resp []*open_api_models.GettableSilence
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		return resp
+	}
+
+	stateSet := func(sils []*open_api_models.GettableSilence) map[string]bool {
+		states := make(map[string]bool, len(sils))
+		for _, s := range sils {
+			states[string(*s.Status.State)] = true
+		}
+		return states
+	}
+
+	// No filter params (all true) - all three states returned.
+	require.Len(t, callHandler(new(true), new(true), new(true)), 3)
+
+	// active=false - active silences excluded.
+	got := stateSet(callHandler(new(false), new(true), new(true)))
+	require.False(t, got["active"])
+	require.True(t, got["expired"] || got["pending"])
+
+	// expired=false - expired silences excluded.
+	got = stateSet(callHandler(new(true), new(false), new(true)))
+	require.False(t, got["expired"])
+
+	// pending=false - pending silences excluded.
+	got = stateSet(callHandler(new(true), new(true), new(false)))
+	require.False(t, got["pending"])
+
+	// all false - empty result.
+	require.Empty(t, callHandler(new(false), new(false), new(false)))
+}
+
+func TestGetSilencesHandlerEndBoundary(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := newSilences(t)
+		now := time.Now().UTC()
+		sil := &silencepb.Silence{
+			MatcherSets: []*silencepb.MatcherSet{{Matchers: []*silencepb.Matcher{{Name: "alertname", Pattern: "Foo"}}}},
+			StartsAt:    timestamppb.New(now),
+			EndsAt:      timestamppb.New(now.Add(time.Minute)),
+		}
+		require.NoError(t, store.Set(t.Context(), sil))
+		api := API{silences: store, logger: promslog.NewNopLogger()}
+		time.Sleep(time.Minute)
+		for _, expired := range []bool{false, true} {
+			response := api.getSilencesHandler(silence_ops.GetSilencesParams{
+				HTTPRequest: httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v2/silences", nil),
+				Active:      new(!expired),
+				Expired:     new(expired),
+				Pending:     new(false),
+			}).(*silence_ops.GetSilencesOK)
+			if !expired {
+				require.Empty(t, response.Payload)
+				continue
+			}
+			require.Len(t, response.Payload, 1)
+			require.Equal(t, string(silence.SilenceStateExpired), *response.Payload[0].Status.State)
+			require.Equal(t, sil.Id, *response.Payload[0].ID)
+		}
+	})
+}
+
+func TestGettableSilenceFromProtoAt(t *testing.T) {
+	t.Parallel()
+
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Now()
+		sil := &silencepb.Silence{
+			StartsAt:  timestamppb.New(now),
+			EndsAt:    timestamppb.New(now.Add(time.Minute)),
+			UpdatedAt: timestamppb.New(now),
+		}
+		time.Sleep(time.Hour)
+		current, err := GettableSilenceFromProto(sil)
+		require.NoError(t, err)
+		require.Equal(t, string(silence.SilenceStateExpired), *current.Status.State)
+		evaluated, err := gettableSilenceFromProtoAt(sil, now)
+		require.NoError(t, err)
+		require.Equal(t, string(silence.SilenceStateActive), *evaluated.Status.State)
+	})
+}
+
+func TestDeleteSilenceHandler(t *testing.T) {
+	now := timestamppb.Now()
+	silences := newSilences(t)
+
+	m := &silencepb.Matcher{Type: silencepb.Matcher_EQUAL, Name: "a", Pattern: "b"}
+
+	unexpiredSil := &silencepb.Silence{
+		MatcherSets: []*silencepb.MatcherSet{{
+			Matchers: []*silencepb.Matcher{m},
+		}},
+		StartsAt:  now,
+		EndsAt:    timestamppb.New(now.AsTime().Add(time.Hour)),
+		UpdatedAt: now,
+	}
+	require.NoError(t, silences.Set(t.Context(), unexpiredSil))
+
+	expiredSil := &silencepb.Silence{
+		MatcherSets: []*silencepb.MatcherSet{{
+			Matchers: []*silencepb.Matcher{m},
+		}},
+		StartsAt:  timestamppb.New(now.AsTime().Add(-time.Hour)),
+		EndsAt:    timestamppb.New(now.AsTime().Add(time.Hour)),
+		UpdatedAt: now,
+	}
+	require.NoError(t, silences.Set(t.Context(), expiredSil))
+	require.NoError(t, silences.Expire(t.Context(), expiredSil.Id))
+
+	for i, tc := range []struct {
+		sid          string
+		expectedCode int
+	}{
+		{
+			"unknownSid",
+			404,
+		},
+		{
+			unexpiredSil.Id,
+			200,
+		},
+		{
+			expiredSil.Id,
+			200,
+		},
+	} {
+		api := API{
+			uptime:   time.Now(),
+			silences: silences,
+			logger:   promslog.NewNopLogger(),
+		}
+
+		r, err := http.NewRequest("DELETE", "/api/v2/silence/${tc.sid}", nil)
+		require.NoError(t, err)
+
+		w := httptest.NewRecorder()
+		p := runtime.TextProducer()
+		responder := api.deleteSilenceHandler(silence_ops.DeleteSilenceParams{
+			SilenceID:   strfmt.UUID(tc.sid),
+			HTTPRequest: r,
+		})
+		responder.WriteResponse(w, p)
+		body, _ := io.ReadAll(w.Result().Body)
+
+		require.Equal(t, tc.expectedCode, w.Code, "test case: %d, response: %s", i, string(body))
+	}
+}
+
+func TestPostSilencesHandler(t *testing.T) {
+	now := timestamppb.Now()
+	silences := newSilences(t)
+
+	m := &silencepb.Matcher{Type: silencepb.Matcher_EQUAL, Name: "a", Pattern: "b"}
+
+	unexpiredSil := &silencepb.Silence{
+		MatcherSets: []*silencepb.MatcherSet{{
+			Matchers: []*silencepb.Matcher{m},
+		}},
+		StartsAt:  now,
+		EndsAt:    timestamppb.New(now.AsTime().Add(time.Hour)),
+		UpdatedAt: now,
+	}
+	require.NoError(t, silences.Set(t.Context(), unexpiredSil))
+
+	expiredSil := &silencepb.Silence{
+		MatcherSets: []*silencepb.MatcherSet{{
+			Matchers: []*silencepb.Matcher{m},
+		}},
+		StartsAt:  timestamppb.New(now.AsTime().Add(-time.Hour)),
+		EndsAt:    timestamppb.New(now.AsTime().Add(time.Hour)),
+		UpdatedAt: now,
+	}
+	require.NoError(t, silences.Set(t.Context(), expiredSil))
+	require.NoError(t, silences.Expire(t.Context(), expiredSil.Id))
+
+	t.Run("Silences CRUD", func(t *testing.T) {
+		for i, tc := range []struct {
+			name         string
+			sid          string
+			start, end   time.Time
+			expectedCode int
+		}{
+			{
+				"with an non-existent silence ID - it returns 404",
+				"unknownSid",
+				now.AsTime().Add(time.Hour),
+				now.AsTime().Add(time.Hour * 2),
+				404,
+			},
+			{
+				"with no silence ID - it creates the silence",
+				"",
+				now.AsTime().Add(time.Hour),
+				now.AsTime().Add(time.Hour * 2),
+				200,
+			},
+			{
+				"with an active silence ID - it extends the silence",
+				unexpiredSil.Id,
+				now.AsTime().Add(time.Hour),
+				now.AsTime().Add(time.Hour * 2),
+				200,
+			},
+			{
+				"with an expired silence ID - it re-creates the silence",
+				expiredSil.Id,
+				now.AsTime().Add(time.Hour),
+				now.AsTime().Add(time.Hour * 2),
+				200,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				api := API{
+					uptime:   time.Now(),
+					silences: silences,
+					logger:   promslog.NewNopLogger(),
+				}
+
+				sil := createSilence(t, tc.sid, "silenceCreator", tc.start, tc.end)
+				w := httptest.NewRecorder()
+				postSilences(t, w, api.postSilencesHandler, sil)
+				body, _ := io.ReadAll(w.Result().Body)
+				require.Equal(t, tc.expectedCode, w.Code, "test case: %d, response: %s", i, string(body))
+			})
+		}
+	})
+}
+
+func TestPostSilencesHandlerMissingIdCreatesSilence(t *testing.T) {
+	now := time.Now()
+	silences := newSilences(t)
+	api := API{
+		uptime:   time.Now(),
+		silences: silences,
+		logger:   promslog.NewNopLogger(),
+	}
+
+	// Create a new silence. It should be assigned a random UUID.
+	sil := createSilence(t, "", "silenceCreator", now.Add(time.Hour), now.Add(time.Hour*2))
+	w := httptest.NewRecorder()
+	postSilences(t, w, api.postSilencesHandler, sil)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// Get the silences from the API.
+	w = httptest.NewRecorder()
+	getSilences(t, w, api.getSilencesHandler)
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp []open_api_models.GettableSilence
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	require.Len(t, resp, 1)
+
+	// Change the ID. It should return 404 Not Found.
+	sil = open_api_models.PostableSilence{
+		ID:      "unknownID",
+		Silence: resp[0].Silence,
+	}
+	w = httptest.NewRecorder()
+	postSilences(t, w, api.postSilencesHandler, sil)
+	require.Equal(t, http.StatusNotFound, w.Code)
+
+	// Remove the ID. It should duplicate the silence with a different UUID.
+	sil = open_api_models.PostableSilence{
+		ID:      "",
+		Silence: resp[0].Silence,
+	}
+	w = httptest.NewRecorder()
+	postSilences(t, w, api.postSilencesHandler, sil)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	// Get the silences from the API. There should now be 2 silences.
+	w = httptest.NewRecorder()
+	getSilences(t, w, api.getSilencesHandler)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	require.Len(t, resp, 2)
+	require.NotEqual(t, resp[0].ID, resp[1].ID)
+}
+
+func getSilences(
+	t *testing.T,
+	w *httptest.ResponseRecorder,
+	handlerFunc func(params silence_ops.GetSilencesParams) middleware.Responder,
+) {
+	r, err := http.NewRequest("GET", "/api/v2/silences", nil)
+	require.NoError(t, err)
+
+	params := silence_ops.NewGetSilencesParams()
+	params.HTTPRequest = r
+
+	p := runtime.TextProducer()
+	responder := handlerFunc(params)
+	responder.WriteResponse(w, p)
+}
+
+func postSilences(
+	t *testing.T,
+	w *httptest.ResponseRecorder,
+	handlerFunc func(params silence_ops.PostSilencesParams) middleware.Responder,
+	sil open_api_models.PostableSilence,
+) {
+	b, err := json.Marshal(sil)
+	require.NoError(t, err)
+
+	r, err := http.NewRequest("POST", "/api/v2/silences", bytes.NewReader(b))
+	require.NoError(t, err)
+
+	p := runtime.TextProducer()
+	responder := handlerFunc(silence_ops.PostSilencesParams{
+		HTTPRequest: r,
+		Silence:     &sil,
+	})
+	responder.WriteResponse(w, p)
+}
+
+func TestCheckSilenceMatchesFilterLabels(t *testing.T) {
+	t.Parallel()
+
+	type test struct {
+		silenceMatchers []*silencepb.Matcher
+		filterMatchers  []*labels.Matcher
+		expected        bool
+	}
+
+	tests := []test{
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "value", silencepb.Matcher_EQUAL)},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "value", labels.MatchEqual)},
+			true,
+		},
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "value", silencepb.Matcher_EQUAL)},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "novalue", labels.MatchEqual)},
+			false,
+		},
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "(foo|bar)", silencepb.Matcher_REGEXP)},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "(foo|bar)", labels.MatchRegexp)},
+			true,
+		},
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "foo", silencepb.Matcher_REGEXP)},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "(foo|bar)", labels.MatchRegexp)},
+			false,
+		},
+
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "value", silencepb.Matcher_EQUAL)},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "value", labels.MatchRegexp)},
+			false,
+		},
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "value", silencepb.Matcher_REGEXP)},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "value", labels.MatchEqual)},
+			false,
+		},
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "value", silencepb.Matcher_NOT_EQUAL)},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "value", labels.MatchNotEqual)},
+			true,
+		},
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "value", silencepb.Matcher_NOT_REGEXP)},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "value", labels.MatchNotRegexp)},
+			true,
+		},
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "value", silencepb.Matcher_EQUAL)},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "value", labels.MatchNotEqual)},
+			false,
+		},
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "value", silencepb.Matcher_REGEXP)},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "value", labels.MatchNotRegexp)},
+			false,
+		},
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "value", silencepb.Matcher_NOT_EQUAL)},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "value", labels.MatchNotRegexp)},
+			false,
+		},
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "value", silencepb.Matcher_NOT_REGEXP)},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "value", labels.MatchNotEqual)},
+			false,
+		},
+		{
+			[]*silencepb.Matcher{
+				createSilenceMatcher(t, "label", "(foo|bar)", silencepb.Matcher_REGEXP),
+				createSilenceMatcher(t, "label", "value", silencepb.Matcher_EQUAL),
+			},
+			[]*labels.Matcher{createLabelMatcher(t, "label", "(foo|bar)", labels.MatchRegexp)},
+			true,
+		},
+		{
+			[]*silencepb.Matcher{createSilenceMatcher(t, "label", "value", silencepb.Matcher_EQUAL)},
+			[]*labels.Matcher{{Name: "label", Value: "value", Type: -1}},
+			false,
+		},
+		{
+			[]*silencepb.Matcher{nil},
+			[]*labels.Matcher{{}},
+			false,
+		},
+		{
+			[]*silencepb.Matcher{{}},
+			[]*labels.Matcher{nil},
+			false,
+		},
+		{
+			[]*silencepb.Matcher{nil, {}},
+			[]*labels.Matcher{{}},
+			true,
+		},
+	}
+
+	for _, test := range tests {
+		silence := silencepb.Silence{
+			MatcherSets: []*silencepb.MatcherSet{{
+				Matchers: test.silenceMatchers,
+			}},
+		}
+		actual := CheckSilenceMatchesFilterLabels(&silence, test.filterMatchers)
+		if test.expected != actual {
+			t.Fatal("unexpected match result between silence and filter. expected:", test.expected, ", actual:", actual)
+		}
+	}
+
+	t.Run("empty filter", func(t *testing.T) {
+		t.Parallel()
+		require.False(t, CheckSilenceMatchesFilterLabels(&silencepb.Silence{}, nil))
+		require.True(t, CheckSilenceMatchesFilterLabels(&silencepb.Silence{MatcherSets: []*silencepb.MatcherSet{{}}}, nil))
+	})
+
+	t.Run("multiple stored sets", func(t *testing.T) {
+		t.Parallel()
+		alertname := &labels.Matcher{Name: "alertname", Value: "Foo", Type: labels.MatchEqual}
+		service := &labels.Matcher{Name: "service", Value: "api", Type: labels.MatchEqual}
+		sil := &silencepb.Silence{MatcherSets: []*silencepb.MatcherSet{
+			nil,
+			{Matchers: []*silencepb.Matcher{{Name: "alertname", Pattern: "Foo", Type: silencepb.Matcher_EQUAL}}},
+			{Matchers: []*silencepb.Matcher{{Name: "service", Pattern: "api", Type: silencepb.Matcher_EQUAL}}},
+		}}
+		require.True(t, CheckSilenceMatchesFilterLabels(sil, []*labels.Matcher{service}))
+		require.False(t, CheckSilenceMatchesFilterLabels(sil, []*labels.Matcher{alertname, service}))
+	})
+}
+
+func convertDateTime(ts time.Time) *strfmt.DateTime {
+	dt := strfmt.DateTime(ts)
+	return &dt
+}
+
+func TestAlertToOpenAPIAlert(t *testing.T) {
+	var (
+		start     = time.Now().Add(-time.Minute)
+		updated   = time.Now()
+		active    = "active"
+		fp        = "0223b772b51c29e1"
+		receivers = []string{"receiver1", "receiver2"}
+
+		a = alert.New(model.Alert{
+			Labels:   model.LabelSet{"severity": "critical", "alertname": "alert1"},
+			StartsAt: start,
+		}, updated, false)
+	)
+	openAPIAlert := AlertToOpenAPIAlert(a, alert.AlertStatus{State: alert.AlertStateActive}, receivers, nil)
+	require.Equal(t, &open_api_models.GettableAlert{
+		Annotations: open_api_models.LabelSet{},
+		Alert: open_api_models.Alert{
+			Labels: open_api_models.LabelSet{"severity": "critical", "alertname": "alert1"},
+		},
+		StartsAt:    convertDateTime(start),
+		EndsAt:      convertDateTime(time.Time{}),
+		UpdatedAt:   convertDateTime(updated),
+		Fingerprint: &fp,
+		Receivers: []*open_api_models.ReceiverReference{
+			{Name: &receivers[0]},
+			{Name: &receivers[1]},
+		},
+		Status: &open_api_models.AlertStatus{
+			State:       &active,
+			InhibitedBy: []string{},
+			SilencedBy:  []string{},
+			MutedBy:     []string{},
+		},
+	}, openAPIAlert)
+}
+
+func TestMatchFilterLabels(t *testing.T) {
+	sms := map[string]string{
+		"foo": "bar",
+	}
+
+	testCases := []struct {
+		matcher  labels.MatchType
+		name     string
+		val      string
+		expected bool
+	}{
+		{labels.MatchEqual, "foo", "bar", true},
+		{labels.MatchEqual, "baz", "", true},
+		{labels.MatchEqual, "baz", "qux", false},
+		{labels.MatchEqual, "baz", "qux|", false},
+		{labels.MatchRegexp, "foo", "bar", true},
+		{labels.MatchRegexp, "baz", "", true},
+		{labels.MatchRegexp, "baz", "qux", false},
+		{labels.MatchRegexp, "baz", "qux|", true},
+		{labels.MatchNotEqual, "foo", "bar", false},
+		{labels.MatchNotEqual, "baz", "", false},
+		{labels.MatchNotEqual, "baz", "qux", true},
+		{labels.MatchNotEqual, "baz", "qux|", true},
+		{labels.MatchNotRegexp, "foo", "bar", false},
+		{labels.MatchNotRegexp, "baz", "", false},
+		{labels.MatchNotRegexp, "baz", "qux", true},
+		{labels.MatchNotRegexp, "baz", "qux|", false},
+	}
+
+	for _, tc := range testCases {
+		m, err := labels.NewMatcher(tc.matcher, tc.name, tc.val)
+		require.NoError(t, err)
+
+		ms := []*labels.Matcher{m}
+		require.Equal(t, tc.expected, matchFilterLabels(ms, sms))
+	}
+}
+
+func TestGetReceiversHandler(t *testing.T) {
+	in := `
+route:
+    receiver: team-X
+
+receivers:
+- name: 'team-X'
+- name: 'team-Y'
+`
+	cfg, _ := config.Load(in)
+	api := API{
+		uptime:             time.Now(),
+		logger:             promslog.NewNopLogger(),
+		alertmanagerConfig: cfg,
+	}
+
+	for _, tc := range []struct {
+		body         string
+		expectedCode int
+	}{
+		{
+			`[{"labels":{"name":"team-X"},"name":"team-X"},{"labels":{"name":"team-Y"},"name":"team-Y"}]`,
+			200,
+		},
+	} {
+		r, err := http.NewRequest("GET", "/api/v2/receivers", nil)
+		require.NoError(t, err)
+
+		w := httptest.NewRecorder()
+		p := runtime.TextProducer()
+		responder := api.getReceiversHandler(receiver_ops.GetReceiversParams{
+			HTTPRequest: r,
+		})
+		responder.WriteResponse(w, p)
+		body, _ := io.ReadAll(w.Result().Body)
+
+		require.Equal(t, tc.expectedCode, w.Code)
+		require.Equal(t, tc.body, string(body))
+	}
+}
+
+func TestGetReceiversHandlerWithLabels(t *testing.T) {
+	in := `
+route:
+    receiver: team-X
+
+receivers:
+- name: 'team-X'
+  labels:
+    owner: platform
+    kind: heartbeat
+- name: 'team-Y'
+`
+	cfg, err := config.Load(in)
+	require.NoError(t, err)
+
+	api := API{
+		uptime:             time.Now(),
+		logger:             promslog.NewNopLogger(),
+		alertmanagerConfig: cfg,
+	}
+
+	r, err := http.NewRequest("GET", "/api/v2/receivers", nil)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	p := runtime.TextProducer()
+	responder := api.getReceiversHandler(receiver_ops.GetReceiversParams{
+		HTTPRequest: r,
+	})
+	responder.WriteResponse(w, p)
+
+	require.Equal(t, 200, w.Code)
+
+	var receivers []*open_api_models.Receiver
+	err = json.Unmarshal(w.Body.Bytes(), &receivers)
+	require.NoError(t, err)
+	require.Len(t, receivers, 2)
+
+	// team-X has user-defined labels plus auto-injected name.
+	require.Equal(t, "team-X", *receivers[0].Name)
+	require.Equal(t, "team-X", receivers[0].Labels["name"])
+	require.Equal(t, "platform", receivers[0].Labels["owner"])
+	require.Equal(t, "heartbeat", receivers[0].Labels["kind"])
+
+	// team-Y has only the auto-injected name label.
+	require.Equal(t, "team-Y", *receivers[1].Name)
+	require.Equal(t, "team-Y", receivers[1].Labels["name"])
+	require.Len(t, receivers[1].Labels, 1)
+}
+
+func TestGetReceiversHandlerWithReceiverMatchers(t *testing.T) {
+	in := `
+route:
+    receiver: team-X
+
+receivers:
+- name: 'team-X'
+  labels:
+    owner: platform
+    kind: heartbeat
+- name: 'team-Y'
+  labels:
+    owner: security
+- name: 'team-Z'
+  labels:
+    owner: platform
+    kind: paging
+`
+	cfg, err := config.Load(in)
+	require.NoError(t, err)
+
+	api := API{
+		uptime:             time.Now(),
+		logger:             promslog.NewNopLogger(),
+		alertmanagerConfig: cfg,
+	}
+
+	for _, tc := range []struct {
+		desc             string
+		receiverMatchers []string
+		expectedNames    []string
+	}{
+		{
+			desc:             "filter by owner",
+			receiverMatchers: []string{`owner="platform"`},
+			expectedNames:    []string{"team-X", "team-Z"},
+		},
+		{
+			desc:             "filter by kind",
+			receiverMatchers: []string{`kind="heartbeat"`},
+			expectedNames:    []string{"team-X"},
+		},
+		{
+			desc:             "filter by multiple matchers",
+			receiverMatchers: []string{`owner="platform"`, `kind="paging"`},
+			expectedNames:    []string{"team-Z"},
+		},
+		{
+			desc:             "no match",
+			receiverMatchers: []string{`owner="nonexistent"`},
+			expectedNames:    []string{},
+		},
+		{
+			desc:             "no filter returns all",
+			receiverMatchers: nil,
+			expectedNames:    []string{"team-X", "team-Y", "team-Z"},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			r, err := http.NewRequest("GET", "/api/v2/receivers", nil)
+			require.NoError(t, err)
+
+			w := httptest.NewRecorder()
+			p := runtime.TextProducer()
+			responder := api.getReceiversHandler(receiver_ops.GetReceiversParams{
+				HTTPRequest:      r,
+				ReceiverMatchers: tc.receiverMatchers,
+			})
+			responder.WriteResponse(w, p)
+
+			require.Equal(t, 200, w.Code)
+
+			var receivers []*open_api_models.Receiver
+			err = json.Unmarshal(w.Body.Bytes(), &receivers)
+			require.NoError(t, err)
+
+			names := make([]string, 0, len(receivers))
+			for _, rcv := range receivers {
+				names = append(names, *rcv.Name)
+			}
+			require.Equal(t, tc.expectedNames, names)
+		})
+	}
+}
+
+func TestReceiversMatchLabels(t *testing.T) {
+	rcvLabels := map[string]open_api_models.LabelSet{
+		"team-x-slack":     {"name": "team-x-slack", "owner": "team-x", "kind": "heartbeat"},
+		"team-y-pagerduty": {"name": "team-y-pagerduty", "owner": "team-y"},
+		"team-z-email":     {"name": "team-z-email", "owner": "team-z"},
+	}
+
+	testCases := []struct {
+		desc      string
+		receivers []string
+		matcher   string
+		expected  bool
+	}{
+		{
+			desc:      "match owner label",
+			receivers: []string{"team-x-slack"},
+			matcher:   `owner="team-x"`,
+			expected:  true,
+		},
+		{
+			desc:      "no match owner label",
+			receivers: []string{"team-x-slack"},
+			matcher:   `owner="team-y"`,
+			expected:  false,
+		},
+		{
+			desc:      "match among multiple receivers",
+			receivers: []string{"team-x-slack", "team-y-pagerduty"},
+			matcher:   `owner="team-y"`,
+			expected:  true,
+		},
+		{
+			desc:      "match by kind label",
+			receivers: []string{"team-x-slack", "team-y-pagerduty"},
+			matcher:   `kind="heartbeat"`,
+			expected:  true,
+		},
+		{
+			desc:      "no match - label not present on any receiver",
+			receivers: []string{"team-y-pagerduty", "team-z-email"},
+			matcher:   `kind="heartbeat"`,
+			expected:  false,
+		},
+		{
+			desc:      "match by name label",
+			receivers: []string{"team-x-slack"},
+			matcher:   `name="team-x-slack"`,
+			expected:  true,
+		},
+		{
+			desc:      "unknown receiver",
+			receivers: []string{"nonexistent"},
+			matcher:   `owner="team-x"`,
+			expected:  false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			matchers, err := parseFilter([]string{tc.matcher})
+			require.NoError(t, err)
+
+			result := receiversMatchLabels(tc.receivers, matchers, rcvLabels)
+			require.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestReceiversMatchLabelsRegex(t *testing.T) {
+	rcvLabels := map[string]open_api_models.LabelSet{
+		"team-x-slack":     {"name": "team-x-slack", "owner": "team-x", "kind": "heartbeat"},
+		"team-y-pagerduty": {"name": "team-y-pagerduty", "owner": "team-y", "kind": "paging"},
+	}
+
+	testCases := []struct {
+		desc      string
+		receivers []string
+		matcher   string
+		expected  bool
+	}{
+		{
+			desc:      "regex match on owner",
+			receivers: []string{"team-x-slack"},
+			matcher:   `owner=~"team-."`,
+			expected:  true,
+		},
+		{
+			desc:      "regex no match",
+			receivers: []string{"team-x-slack"},
+			matcher:   `owner=~"squad-."`,
+			expected:  false,
+		},
+		{
+			desc:      "not equal match",
+			receivers: []string{"team-x-slack", "team-y-pagerduty"},
+			matcher:   `kind!="heartbeat"`,
+			expected:  true,
+		},
+		{
+			desc:      "not regex match",
+			receivers: []string{"team-x-slack"},
+			matcher:   `kind!~"pag.*"`,
+			expected:  true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.desc, func(t *testing.T) {
+			matchers, err := parseFilter([]string{tc.matcher})
+			require.NoError(t, err)
+
+			result := receiversMatchLabels(tc.receivers, matchers, rcvLabels)
+			require.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestGetReceiversHandlerBadReceiverMatchers(t *testing.T) {
+	in := `
+route:
+    receiver: team-X
+
+receivers:
+- name: 'team-X'
+`
+	cfg, err := config.Load(in)
+	require.NoError(t, err)
+
+	api := API{
+		uptime:             time.Now(),
+		logger:             promslog.NewNopLogger(),
+		alertmanagerConfig: cfg,
+	}
+
+	r, err := http.NewRequest("GET", "/api/v2/receivers", nil)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	p := runtime.TextProducer()
+	responder := api.getReceiversHandler(receiver_ops.GetReceiversParams{
+		HTTPRequest:      r,
+		ReceiverMatchers: []string{"not-a-valid-matcher!!!"},
+	})
+	responder.WriteResponse(w, p)
+
+	require.Equal(t, 400, w.Code)
+}
+
+func BenchmarkOpenAPIAlertsToAlerts(b *testing.B) {
+	now := strfmt.DateTime(time.Now())
+	apiAlerts := make(open_api_models.PostableAlerts, 100)
+	for i := range apiAlerts {
+		apiAlerts[i] = &open_api_models.PostableAlert{
+			Alert: open_api_models.Alert{
+				Labels: open_api_models.LabelSet{"alertname": "test", "i": strconv.Itoa(i)},
+			},
+			StartsAt: now,
+			EndsAt:   now,
+		}
+	}
+
+	b.Run("PreAllocated", func(b *testing.B) {
+		ctx := context.Background()
+		for i := 0; i < b.N; i++ {
+			OpenAPIAlertsToAlerts(ctx, apiAlerts)
+		}
+	})
+
+	b.Run("AppendGrowth", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			alerts := []model.Alert{}
+			for _, apiAlert := range apiAlerts {
+				alerts = append(alerts, model.Alert{
+					Labels:       APILabelSetToModelLabelSet(apiAlert.Labels),
+					Annotations:  APILabelSetToModelLabelSet(apiAlert.Annotations),
+					StartsAt:     time.Time(apiAlert.StartsAt),
+					EndsAt:       time.Time(apiAlert.EndsAt),
+					GeneratorURL: string(apiAlert.GeneratorURL),
+				})
+			}
+			_ = alerts
+		}
+	})
+}
+
+func TestPostSilences_QuotedMatchers(t *testing.T) {
+	// This test ensures that quoted values in matchers are preserved during JSON unmarshalling
+	jsonBlob := `{"comment":"foo", "createdBy": "author", "startsAt":"2023-03-06T00:22:15Z", "endsAt":"2024-03-06T00:22:15Z", "matchers":[{"isRegex":true, "name":"instance", "value":"\"bar\""}]}`
+
+	var ps open_api_models.PostableSilence
+	err := json.Unmarshal([]byte(jsonBlob), &ps)
+	require.NoError(t, err)
+
+	require.Len(t, ps.Matchers, 1)
+	require.Equal(t, "\"bar\"", *ps.Matchers[0].Value)
+
+	silProto, err := PostableSilenceToProto(&ps)
+	require.NoError(t, err)
+	require.Len(t, silProto.MatcherSets, 1)
+	require.Len(t, silProto.MatcherSets[0].Matchers, 1)
+	require.Equal(t, "\"bar\"", silProto.MatcherSets[0].Matchers[0].Pattern)
+}
+
+// staticAlertGroups returns a groupsFn that serves a fixed set of groups the
+// way dispatch.Groups does: it calls the filter once per alert per group,
+// drops the alerts the filter rejects and records the status it returns in
+// AlertStatuses. The groups passed in are not modified.
+func staticAlertGroups(groups dispatch.AlertGroups, receivers map[model.Fingerprint][]string) groupsFn {
+	return func(_ context.Context, _ func(*dispatch.Route) bool, af dispatch.AlertFilter) (dispatch.AlertGroups, map[model.Fingerprint][]string, error) {
+		now := time.Now()
+		res := make(dispatch.AlertGroups, 0, len(groups))
+		for _, g := range groups {
+			out := *g
+			out.Alerts = make(alert.AlertSlice, 0, len(g.Alerts))
+			out.AlertStatuses = make(map[model.Fingerprint]alert.AlertStatus, len(g.Alerts))
+			for _, a := range g.Alerts {
+				status, ok := af(a, now)
+				if !ok {
+					continue
+				}
+				out.Alerts = append(out.Alerts, a)
+				out.AlertStatuses[a.Fingerprint()] = status
+			}
+			res = append(res, &out)
+		}
+		return res, receivers, nil
+	}
+}
+
+func TestGetAlertGroupsHandlerRouteLabels(t *testing.T) {
+	in := `
+route:
+    receiver: team-X
+    routes:
+      - receiver: team-X
+        labels:
+          team: X
+
+receivers:
+- name: 'team-X'
+`
+	cfg, err := config.Load(in)
+	require.NoError(t, err)
+
+	group := &dispatch.AlertGroup{
+		Labels:      model.LabelSet{"alertname": "Foo"},
+		RouteLabels: model.LabelSet{"team": "X"},
+		Receiver:    "team-X",
+		GroupKey:    "key",
+	}
+
+	api := API{
+		uptime:      time.Now(),
+		logger:      promslog.NewNopLogger(),
+		alertGroups: staticAlertGroups(dispatch.AlertGroups{group}, nil),
+	}
+	api.Update(cfg, func(context.Context, labelset.LabelSet) {})
+
+	r, err := http.NewRequest("GET", "/api/v2/alerts/groups", nil)
+	require.NoError(t, err)
+
+	truePtr := true
+	responder := api.getAlertGroupsHandler(alertgroup_ops.GetAlertGroupsParams{
+		HTTPRequest: r,
+		Active:      &truePtr,
+		Silenced:    &truePtr,
+		Inhibited:   &truePtr,
+		Muted:       &truePtr,
+	})
+
+	w := httptest.NewRecorder()
+	responder.WriteResponse(w, runtime.JSONProducer())
+	require.Equal(t, 200, w.Code)
+
+	body, _ := io.ReadAll(w.Result().Body)
+
+	var groups open_api_models.AlertGroups
+	require.NoError(t, json.Unmarshal(body, &groups))
+	require.Len(t, groups, 1)
+	require.Equal(t, open_api_models.LabelSet{"team": "X"}, groups[0].RouteLabels)
+}
+
+// TestGetAlertGroupsHandlerPredictsStatusPerGroup checks that the handler
+// runs the inhibitor/silencer pipeline exactly once per alert per group (not
+// twice, and not shared across groups) and that each group reports the status
+// from its own evaluation.
+func TestGetAlertGroupsHandlerPredictsStatusPerGroup(t *testing.T) {
+	in := `
+route:
+    receiver: team-X
+
+receivers:
+- name: 'team-X'
+`
+	cfg, err := config.Load(in)
+	require.NoError(t, err)
+
+	a := alert.New(model.Alert{Labels: model.LabelSet{"alertname": "Foo"}}, time.Now(), false)
+	groups := dispatch.AlertGroups{
+		{Labels: model.LabelSet{"alertname": "Foo"}, Receiver: "team-X", GroupKey: "key1", Alerts: []*alert.Alert{a}},
+		{Labels: model.LabelSet{"alertname": "Foo"}, Receiver: "team-X", GroupKey: "key2", Alerts: []*alert.Alert{a}},
+	}
+
+	api := API{
+		uptime:      time.Now(),
+		logger:      promslog.NewNopLogger(),
+		alertGroups: staticAlertGroups(groups, nil),
+	}
+
+	// Each pipeline run reports a distinct silence ID so the response shows
+	// which evaluation each group's status came from.
+	calls := 0
+	api.Update(cfg, func(ctx context.Context, lset labelset.LabelSet) {
+		calls++
+		m, ok := marker.FromContext(ctx)
+		require.True(t, ok)
+		m.SetSilenced(lset.Fingerprint(), []string{fmt.Sprintf("sil-%d", calls)})
+		m.SetInhibited(lset.Fingerprint(), nil)
+	})
+
+	r, err := http.NewRequest("GET", "/api/v2/alerts/groups", nil)
+	require.NoError(t, err)
+
+	truePtr := true
+	responder := api.getAlertGroupsHandler(alertgroup_ops.GetAlertGroupsParams{
+		HTTPRequest: r,
+		Active:      &truePtr,
+		Silenced:    &truePtr,
+		Inhibited:   &truePtr,
+		Muted:       &truePtr,
+	})
+
+	w := httptest.NewRecorder()
+	responder.WriteResponse(w, runtime.JSONProducer())
+	require.Equal(t, 200, w.Code)
+
+	body, _ := io.ReadAll(w.Result().Body)
+
+	var got open_api_models.AlertGroups
+	require.NoError(t, json.Unmarshal(body, &got))
+	require.Len(t, got, 2)
+	var silencedBy []string
+	for _, g := range got {
+		require.Len(t, g.Alerts, 1)
+		require.Equal(t, open_api_models.AlertStatusStateSuppressed, *g.Alerts[0].Status.State)
+		require.Len(t, g.Alerts[0].Status.SilencedBy, 1)
+		require.Empty(t, g.Alerts[0].Status.InhibitedBy)
+		silencedBy = append(silencedBy, g.Alerts[0].Status.SilencedBy...)
+	}
+	require.Equal(t, 2, calls, "pipeline must run exactly once per alert per group")
+	require.ElementsMatch(t, []string{"sil-1", "sil-2"}, silencedBy, "each group must report its own evaluation")
+}
+
+// TestAlertFilter checks the filter built by alertFilter: expired alerts and
+// label mismatches are dropped before the pipeline runs, and the
+// active/silenced/inhibited parameters apply to the predicted status, which is
+// returned alongside the decision.
+func TestAlertFilter(t *testing.T) {
+	now := time.Now()
+	firing := alert.New(model.Alert{Labels: model.LabelSet{"alertname": "Foo"}, EndsAt: now.Add(time.Hour)}, now, false)
+	expired := alert.New(model.Alert{Labels: model.LabelSet{"alertname": "Foo"}, EndsAt: now.Add(-time.Hour)}, now, false)
+	fooMatcher, err := labels.NewMatcher(labels.MatchEqual, "alertname", "Foo")
+	require.NoError(t, err)
+	barMatcher, err := labels.NewMatcher(labels.MatchEqual, "alertname", "Bar")
+	require.NoError(t, err)
+
+	type report struct{ silencedBy, inhibitedBy []string }
+	for _, tc := range []struct {
+		name                        string
+		alert                       *alert.Alert
+		matchers                    []*labels.Matcher
+		report                      *report // nil: the pipeline does not report at all.
+		silenced, inhibited, active bool
+		wantCalls                   int
+		wantOK                      bool
+		wantState                   alert.AlertState
+	}{
+		{name: "expired alert is dropped before the pipeline", alert: expired, active: true, wantCalls: 0, wantOK: false},
+		{name: "label mismatch is dropped before the pipeline", alert: firing, matchers: []*labels.Matcher{barMatcher}, active: true, wantCalls: 0, wantOK: false},
+		{name: "active alert kept", alert: firing, matchers: []*labels.Matcher{fooMatcher}, report: &report{}, active: true, wantCalls: 1, wantOK: true, wantState: alert.AlertStateActive},
+		{name: "active alert excluded", alert: firing, report: &report{}, active: false, silenced: true, inhibited: true, wantCalls: 1, wantOK: false, wantState: alert.AlertStateActive},
+		{name: "silenced alert kept", alert: firing, report: &report{silencedBy: []string{"s1"}}, silenced: true, wantCalls: 1, wantOK: true, wantState: alert.AlertStateSuppressed},
+		{name: "silenced alert excluded", alert: firing, report: &report{silencedBy: []string{"s1"}}, active: true, inhibited: true, wantCalls: 1, wantOK: false, wantState: alert.AlertStateSuppressed},
+		{name: "inhibited alert kept", alert: firing, report: &report{inhibitedBy: []string{"i1"}}, inhibited: true, wantCalls: 1, wantOK: true, wantState: alert.AlertStateSuppressed},
+		{name: "inhibited alert excluded", alert: firing, report: &report{inhibitedBy: []string{"i1"}}, active: true, silenced: true, wantCalls: 1, wantOK: false, wantState: alert.AlertStateSuppressed},
+		{name: "unprocessed when the pipeline does not report", alert: firing, report: nil, active: false, wantCalls: 1, wantOK: true, wantState: alert.AlertStateUnprocessed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			api := API{logger: promslog.NewNopLogger()}
+			api.setAlertStatus = func(ctx context.Context, lset labelset.LabelSet) {
+				calls++
+				if tc.report == nil {
+					return
+				}
+				m, ok := marker.FromContext(ctx)
+				require.True(t, ok)
+				m.SetSilenced(lset.Fingerprint(), tc.report.silencedBy)
+				m.SetInhibited(lset.Fingerprint(), tc.report.inhibitedBy)
+			}
+
+			status, ok := api.alertFilter(context.Background(), tc.matchers, tc.silenced, tc.inhibited, tc.active)(tc.alert, now)
+
+			require.Equal(t, tc.wantCalls, calls)
+			require.Equal(t, tc.wantOK, ok)
+			if tc.wantCalls == 0 {
+				return
+			}
+			require.Equal(t, tc.wantState, status.State)
+			require.NotNil(t, status.SilencedBy)
+			require.NotNil(t, status.InhibitedBy)
+			if tc.report != nil {
+				require.ElementsMatch(t, tc.report.silencedBy, status.SilencedBy)
+				require.ElementsMatch(t, tc.report.inhibitedBy, status.InhibitedBy)
+			}
+		})
+	}
+}
+
+// TestStatusCollector checks the single-alert marker used on the read path:
+// it mirrors marker.AlertMarker.Status, including the empty (never nil)
+// slices, and reports an alert as unprocessed until the pipeline sets it.
+func TestStatusCollector(t *testing.T) {
+	var c statusCollector
+	fp := model.Fingerprint(1)
+
+	require.Equal(t, unprocessedStatus(), c.Status(fp))
+
+	c.SetSilenced(fp, nil)
+	c.SetInhibited(fp, nil)
+	require.Equal(t, alert.AlertStatus{State: alert.AlertStateActive, SilencedBy: []string{}, InhibitedBy: []string{}}, c.Status(fp))
+
+	c.SetSilenced(fp, []string{"s1"})
+	require.Equal(t, alert.AlertStatus{State: alert.AlertStateSuppressed, SilencedBy: []string{"s1"}, InhibitedBy: []string{}}, c.Status(fp))
+
+	c.Delete(fp)
+	require.Equal(t, unprocessedStatus(), c.Status(fp))
+}
+
+// TestGetAlertGroupsHandlerMuted checks that the muted filter and the mutedBy
+// annotation follow the time intervals the dispatcher computed for each group,
+// with both kinds flattened into a single list.
+func TestGetAlertGroupsHandlerMuted(t *testing.T) {
+	in := `
+route:
+    receiver: team-X
+
+receivers:
+- name: 'team-X'
+`
+	cfg, err := config.Load(in)
+	require.NoError(t, err)
+
+	newGroup := func(team string, mutedByActive, mutedByMute []string) *dispatch.AlertGroup {
+		labels := model.LabelSet{"alertname": "Foo", "team": model.LabelValue(team)}
+		return &dispatch.AlertGroup{
+			Labels:                     labels,
+			Receiver:                   "team-X",
+			GroupKey:                   team,
+			MutedByActiveTimeIntervals: mutedByActive,
+			MutedByMuteTimeIntervals:   mutedByMute,
+			Alerts: alert.AlertSlice{
+				alert.New(model.Alert{Labels: labels, StartsAt: time.Now().Add(-time.Minute)}, time.Time{}, false),
+			},
+		}
+	}
+	groups := dispatch.AlertGroups{
+		newGroup("muted", []string{"weekdays"}, []string{"weekends"}),
+		newGroup("unmuted", nil, nil),
+	}
+
+	api := API{
+		uptime:      time.Now(),
+		logger:      promslog.NewNopLogger(),
+		alertGroups: staticAlertGroups(groups, nil),
+	}
+	// Neither silenced nor inhibited, so any suppression comes from mutedBy.
+	api.Update(cfg, func(ctx context.Context, lset labelset.LabelSet) {
+		m, ok := marker.FromContext(ctx)
+		require.True(t, ok)
+		m.SetSilenced(lset.Fingerprint(), nil)
+		m.SetInhibited(lset.Fingerprint(), nil)
+	})
+
+	get := func(t *testing.T, muted bool) open_api_models.AlertGroups {
+		t.Helper()
+		r, err := http.NewRequest("GET", "/api/v2/alerts/groups", nil)
+		require.NoError(t, err)
+
+		responder := api.getAlertGroupsHandler(alertgroup_ops.GetAlertGroupsParams{
+			HTTPRequest: r,
+			Active:      new(true),
+			Silenced:    new(true),
+			Inhibited:   new(true),
+			Muted:       &muted,
+		})
+
+		w := httptest.NewRecorder()
+		responder.WriteResponse(w, runtime.JSONProducer())
+		require.Equal(t, 200, w.Code)
+
+		body, _ := io.ReadAll(w.Result().Body)
+		var res open_api_models.AlertGroups
+		require.NoError(t, json.Unmarshal(body, &res))
+		return res
+	}
+
+	t.Run("muted groups are included and annotated", func(t *testing.T) {
+		res := get(t, true)
+		require.Len(t, res, 2)
+		mutedBy := map[string][]string{}
+		states := map[string]string{}
+		for _, g := range res {
+			require.Len(t, g.Alerts, 1)
+			mutedBy[string(g.Labels["team"])] = g.Alerts[0].Status.MutedBy
+			states[string(g.Labels["team"])] = *g.Alerts[0].Status.State
+		}
+		require.Equal(t, map[string][]string{
+			"muted":   {"weekdays", "weekends"},
+			"unmuted": {},
+		}, mutedBy)
+		// A muted group's alerts are reported as suppressed even though the
+		// silencer and inhibitor left them active.
+		require.Equal(t, map[string]string{
+			"muted":   open_api_models.AlertStatusStateSuppressed,
+			"unmuted": open_api_models.AlertStatusStateActive,
+		}, states)
+	})
+
+	t.Run("muted groups are filtered out", func(t *testing.T) {
+		res := get(t, false)
+		require.Len(t, res, 1)
+		require.Equal(t, open_api_models.LabelSet{"alertname": "Foo", "team": "unmuted"}, res[0].Labels)
+	})
+}
+
+// putRecorder is a provider.Alerts that only records what the API stores.
+type putRecorder struct {
+	provider.Alerts
+	stored []*alert.Alert
+}
+
+func (p *putRecorder) Put(_ context.Context, alerts ...*alert.Alert) error {
+	p.stored = append(p.stored, alerts...)
+	return nil
+}
+
+// TestPostAlertsHandlerLabelValidationFollowsCompatMode checks that posted
+// alerts are validated according to the matcher compatibility mode selected
+// through feature flags. It guards against validating with
+// model.Alert.Validate, which follows the deprecated process-wide
+// model.NameValidationScheme instead and would accept UTF-8 label names in
+// classic mode.
+func TestPostAlertsHandlerLabelValidationFollowsCompatMode(t *testing.T) {
+	setMode := func(t *testing.T, feature string) {
+		t.Helper()
+		ff, err := featurecontrol.NewFlags(promslog.NewNopLogger(), feature)
+		require.NoError(t, err)
+		compat.InitFromFlags(promslog.NewNopLogger(), ff)
+	}
+	// compat.InitFromFlags mutates package-global state. Restore the default
+	// classic mode when done so other tests in this package are unaffected.
+	t.Cleanup(func() { setMode(t, featurecontrol.FeatureClassicMode) })
+
+	for _, tc := range []struct {
+		name         string
+		feature      string
+		expectedCode int
+		expectStored int
+	}{
+		{
+			name:         "classic mode rejects UTF-8 label names",
+			feature:      featurecontrol.FeatureClassicMode,
+			expectedCode: 400,
+			expectStored: 0,
+		},
+		{
+			name:         "utf-8 strict mode accepts UTF-8 label names",
+			feature:      featurecontrol.FeatureUTF8StrictMode,
+			expectedCode: 200,
+			expectStored: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setMode(t, tc.feature)
+
+			stored := &putRecorder{}
+			api := API{
+				alerts: stored,
+				logger: promslog.NewNopLogger(),
+				m:      metrics.NewAlerts(prometheus.NewRegistry()),
+				alertmanagerConfig: &config.Config{
+					Global: &config.GlobalConfig{ResolveTimeout: model.Duration(5 * time.Minute)},
+				},
+			}
+
+			now := time.Now()
+			r, err := http.NewRequest("POST", "/api/v2/alerts", nil)
+			require.NoError(t, err)
+
+			w := httptest.NewRecorder()
+			responder := api.postAlertsHandler(alert_ops.PostAlertsParams{
+				HTTPRequest: r,
+				Alerts: open_api_models.PostableAlerts{{
+					Alert: open_api_models.Alert{
+						Labels: open_api_models.LabelSet{"alertname": "test", "Σ": "utf8"},
+					},
+					StartsAt: strfmt.DateTime(now),
+					EndsAt:   strfmt.DateTime(now.Add(time.Hour)),
+				}},
+			})
+			responder.WriteResponse(w, runtime.TextProducer())
+
+			require.Equal(t, tc.expectedCode, w.Code, w.Body.String())
+			if tc.expectedCode == 400 {
+				require.Contains(t, w.Body.String(), "invalid label set")
+			}
+			require.Len(t, stored.stored, tc.expectStored)
+		})
+	}
+}
+
+// TestPostAlertsHandlerIngestsFingerprintedAlerts posts alerts through the API
+// into the real in-memory provider and checks that every alert the provider
+// hands back carries a fingerprint that is set and matches its labels. The
+// fingerprint is computed once in alert.New, so a zero value means an alert
+// reached the provider without going through the constructor.
+func TestPostAlertsHandlerIngestsFingerprintedAlerts(t *testing.T) {
+	alerts, err := mem.NewAlerts(t.Context(), time.Minute, 0, nil, promslog.NewNopLogger(), eventrecorder.NopRecorder(), prometheus.NewRegistry(), nil)
+	require.NoError(t, err)
+	t.Cleanup(alerts.Close)
+
+	api := API{
+		alerts: alerts,
+		logger: promslog.NewNopLogger(),
+		m:      metrics.NewAlerts(prometheus.NewRegistry()),
+		alertmanagerConfig: &config.Config{
+			Global: &config.GlobalConfig{ResolveTimeout: model.Duration(5 * time.Minute)},
+		},
+	}
+	post := func(t *testing.T, postable open_api_models.PostableAlerts) {
+		t.Helper()
+		r, err := http.NewRequest("POST", "/api/v2/alerts", nil)
+		require.NoError(t, err)
+		w := httptest.NewRecorder()
+		api.postAlertsHandler(alert_ops.PostAlertsParams{HTTPRequest: r, Alerts: postable}).WriteResponse(w, runtime.TextProducer())
+		require.Equal(t, 200, w.Code, w.Body.String())
+	}
+
+	const n = 5
+	now := time.Now()
+	posted := make(open_api_models.PostableAlerts, 0, n)
+	want := make(map[model.Fingerprint]model.LabelSet, n)
+	for i := range n {
+		labels := open_api_models.LabelSet{"alertname": "test", "instance": strconv.Itoa(i)}
+		pa := &open_api_models.PostableAlert{
+			Alert:    open_api_models.Alert{Labels: labels},
+			StartsAt: strfmt.DateTime(now),
+		}
+		// Leave EndsAt unset on every other alert so both the explicit end
+		// time and the resolve timeout paths of the handler are exercised.
+		if i%2 == 0 {
+			pa.EndsAt = strfmt.DateTime(now.Add(time.Hour))
+		}
+		posted = append(posted, pa)
+		ls := APILabelSetToModelLabelSet(labels)
+		want[ls.Fingerprint()] = ls
+	}
+	post(t, posted)
+
+	// Post the first alert again, starting inside its stored active range and
+	// ending later, so the provider takes the merge path rather than a plain
+	// replace. The merged alert must keep the fingerprint too.
+	posted[0].StartsAt = strfmt.DateTime(now.Add(time.Minute))
+	posted[0].EndsAt = strfmt.DateTime(now.Add(2 * time.Hour))
+	post(t, posted[:1])
+
+	check := func(t *testing.T, alrt *alert.Alert) {
+		t.Helper()
+		require.NotZero(t, alrt.Fingerprint(), "alert %v has a zero fingerprint", alrt.Labels)
+		require.Equal(t, alrt.Labels.Fingerprint(), alrt.Fingerprint(), "alert %v fingerprint does not match its labels", alrt.Labels)
+		require.Equal(t, alrt.Fingerprint(), alrt.LabelSet().Fingerprint())
+		require.Contains(t, want, alrt.Fingerprint())
+		require.Equal(t, want[alrt.Fingerprint()], alrt.Labels)
+	}
+
+	// Look each alert up by the fingerprint the API is expected to have used.
+	for fp := range want {
+		got, err := alerts.Get(fp)
+		require.NoError(t, err, "alert %v not found under fingerprint %v", want[fp], fp)
+		check(t, got)
+	}
+
+	// And walk everything the provider holds, so nothing stored under a
+	// wrong or zero fingerprint can hide.
+	it := alerts.GetPending()
+	defer it.Close()
+	seen := make(map[model.Fingerprint]int, n)
+	for pa := range it.Next() {
+		check(t, pa.Data)
+		seen[pa.Data.Fingerprint()]++
+	}
+	require.NoError(t, it.Err())
+	require.Len(t, seen, n)
+	for fp, count := range seen {
+		require.Equal(t, 1, count, "fingerprint %v stored %d times", fp, count)
+	}
+}

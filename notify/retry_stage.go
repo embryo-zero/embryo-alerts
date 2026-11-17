@@ -1,0 +1,194 @@
+// Copyright The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+package notify
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/cenkalti/backoff/v5"
+	"github.com/prometheus/common/model"
+
+	"github.com/prometheus/alertmanager/alert"
+	"github.com/prometheus/alertmanager/eventrecorder"
+)
+
+// RetryStage notifies via passed integration with exponential backoff until it
+// succeeds. It aborts if the context is canceled or timed out.
+type RetryStage struct {
+	integration Integration
+	groupName   string
+	metrics     *Metrics
+	labelValues []string
+	recorder    eventrecorder.Recorder
+}
+
+// NewRetryStage returns a new instance of a RetryStage.
+func NewRetryStage(i Integration, groupName string, metrics *Metrics, recorder eventrecorder.Recorder) *RetryStage {
+	labelValues := []string{i.Name()}
+
+	if metrics.ff.EnableReceiverNamesInMetrics() {
+		labelValues = append(labelValues, i.receiverName)
+	}
+
+	return &RetryStage{
+		integration: i,
+		groupName:   groupName,
+		metrics:     metrics,
+		labelValues: labelValues,
+		recorder:    recorder,
+	}
+}
+
+func (r RetryStage) Exec(ctx context.Context, l *slog.Logger, alerts ...*alert.Alert) (context.Context, []*alert.Alert, error) {
+	// Every alert in the group was muted, so there is nothing to deliver. The
+	// stages after this one still run, to record the state of the group.
+	if len(alerts) == 0 {
+		return ctx, alerts, nil
+	}
+
+	r.metrics.numNotifications.WithLabelValues(r.labelValues...).Inc()
+
+	ctx, span := tracer.StartRetryStage(ctx, r.groupName, r.integration.name, r.labelValues, len(alerts))
+	defer span.End()
+
+	l = l.With("receiver", r.groupName, "integration", r.integration.String())
+	if groupKey, ok := GroupKey(ctx); ok {
+		l = l.With("aggrGroup", groupKey)
+	}
+
+	ctx, alerts, failureReason, err := r.exec(ctx, l, alerts...)
+	if err != nil {
+		r.integration.recordFailure(span, failureReason, err)
+		r.metrics.numTotalFailedNotifications.WithLabelValues(append(r.labelValues, failureReason.String())...).Inc()
+		if errors.Is(ctx.Err(), context.Canceled) {
+			l.Debug("Notify failed", "reason", failureReason.String(), "err", err)
+		} else {
+			l.Error("Notify failed", "reason", failureReason.String(), "err", err)
+		}
+	}
+	return ctx, alerts, err
+}
+
+func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*alert.Alert) (context.Context, []*alert.Alert, Reason, error) {
+	var sent alert.AlertSlice
+
+	// If we shouldn't send notifications for resolved alerts, but there are only
+	// resolved alerts, report them all as successfully notified (we still want the
+	// notification log to log them for the next run of DedupStage).
+	if !r.integration.SendResolved() {
+		firing, ok := FiringAlerts(ctx)
+		if !ok {
+			return ctx, nil, DefaultReason, errors.New("firing alerts missing")
+		}
+		if len(firing) == 0 {
+			return ctx, alerts, DefaultReason, nil
+		}
+		for _, a := range alerts {
+			if a.Status() != model.AlertResolved {
+				sent = append(sent, a)
+			}
+		}
+	} else {
+		sent = alerts
+	}
+
+	// backoff/v5's ExponentialBackOff never returns Stop from NextBackOff, so
+	// we retry indefinitely until the context is canceled.
+	b := backoff.NewExponentialBackOff()
+	// Redundant for a freshly constructed ExponentialBackOff, but the BackOff
+	// docs require Reset before first use.
+	b.Reset()
+
+	// Zero delay so the first attempt happens immediately.
+	tick := time.NewTimer(0)
+	defer tick.Stop()
+
+	var (
+		i       = 0
+		iErr    error
+		iReason Reason
+	)
+
+	for {
+
+		// Always check the context first to not notify again.
+		select {
+		case <-ctx.Done():
+			if iErr == nil {
+				iErr = ctx.Err()
+				if errors.Is(iErr, context.Canceled) {
+					iReason = ContextCanceledReason
+				} else if errors.Is(iErr, context.DeadlineExceeded) {
+					iReason = ContextDeadlineExceededReason
+				}
+			}
+
+			if iErr != nil {
+				return ctx, nil, iReason, fmt.Errorf("%s/%s: notify retry canceled after %d attempts: %w", r.groupName, r.integration.String(), i, iErr)
+			}
+			return ctx, nil, DefaultReason, nil
+		default:
+		}
+
+		select {
+		case <-tick.C:
+			now := time.Now()
+			verdict := r.integration.Notify(ctx, sent...)
+			i++
+			dur := time.Since(now)
+			// Back off from the end of the attempt, not from its start, so a
+			// slow failure doesn't eat into the wait.
+			tick.Reset(max(b.NextBackOff(), verdict.Delay()))
+			r.metrics.notificationLatencySeconds.WithLabelValues(r.labelValues...).Observe(dur.Seconds())
+			r.metrics.numNotificationRequestsTotal.WithLabelValues(r.labelValues...).Inc()
+			if err := verdict.Err(); err != nil {
+				r.metrics.numNotificationRequestsFailedTotal.WithLabelValues(r.labelValues...).Inc()
+				if !verdict.ShouldRetry() {
+					return ctx, alerts, verdict.Reason(), fmt.Errorf("%s/%s: notify retry canceled due to unrecoverable error after %d attempts: %w", r.groupName, r.integration.String(), i, err)
+				}
+				if ctx.Err() == nil {
+					if iErr == nil || err.Error() != iErr.Error() || verdict.Reason() != iReason {
+						// Log the error if the context isn't done and the error isn't the same as before.
+						l.Warn("Notify attempt failed, will retry later", "attempts", i, "reason", verdict.Reason().String(), "err", err)
+					}
+					// Save this error to be able to return the last seen error by an
+					// integration upon context timeout.
+					iErr, iReason = err, verdict.Reason()
+				} else if iErr == nil && verdict.Reason() != DefaultReason {
+					iErr, iReason = err, verdict.Reason()
+				}
+			} else {
+				l := l.With(
+					"attempts", i,
+					"duration", dur,
+					"numAlerts", len(sent),
+				)
+				if i <= 1 {
+					l.Debug("Notify success", "alerts", sent)
+				} else {
+					l.Info("Notify success")
+				}
+
+				r.recorder.RecordEvent(ctx, func() eventrecorder.EventData {
+					return newNotificationEvent(ctx, alerts, r.integration)
+				})
+				return ctx, alerts, DefaultReason, nil
+			}
+		case <-ctx.Done():
+		}
+	}
+}

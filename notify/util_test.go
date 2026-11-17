@@ -1,0 +1,371 @@
+// Copyright 2019 Prometheus Team
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package notify
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"path"
+	"reflect"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
+	"github.com/stretchr/testify/require"
+
+	"github.com/prometheus/alertmanager/template"
+)
+
+func TestTruncate(t *testing.T) {
+	type expect struct {
+		out   string
+		trunc bool
+	}
+
+	testCases := []struct {
+		in string
+		n  int
+
+		runes expect
+		bytes expect
+	}{
+		{
+			in:    "",
+			n:     5,
+			runes: expect{out: "", trunc: false},
+			bytes: expect{out: "", trunc: false},
+		},
+		{
+			in:    "abcde",
+			n:     2,
+			runes: expect{out: "ab", trunc: true},
+			bytes: expect{out: "..", trunc: true},
+		},
+		{
+			in:    "abcde",
+			n:     4,
+			runes: expect{out: "abc…", trunc: true},
+			bytes: expect{out: "a…", trunc: true},
+		},
+		{
+			in:    "abcde",
+			n:     5,
+			runes: expect{out: "abcde", trunc: false},
+			bytes: expect{out: "abcde", trunc: false},
+		},
+		{
+			in:    "abcdefgh",
+			n:     5,
+			runes: expect{out: "abcd…", trunc: true},
+			bytes: expect{out: "ab…", trunc: true},
+		},
+		{
+			in:    "a⌘cde",
+			n:     5,
+			runes: expect{out: "a⌘cde", trunc: false},
+			bytes: expect{out: "a…", trunc: true},
+		},
+		{
+			in:    "a⌘cdef",
+			n:     5,
+			runes: expect{out: "a⌘cd…", trunc: true},
+			bytes: expect{out: "a…", trunc: true},
+		},
+		{
+			in:    "世界cdef",
+			n:     3,
+			runes: expect{out: "世界c", trunc: true},
+			bytes: expect{out: "…", trunc: true},
+		},
+		{
+			in:    "❤️✅🚀🔥❌❤️✅🚀🔥❌❤️✅🚀🔥❌❤️✅🚀🔥❌",
+			n:     19,
+			runes: expect{out: "❤️✅🚀🔥❌❤️✅🚀🔥❌❤️✅🚀🔥❌…", trunc: true},
+			bytes: expect{out: "❤️✅🚀…", trunc: true},
+		},
+		{
+			// Two runes, eight bytes: the byte budget left for the text is
+			// larger than the number of runes to pick it from.
+			in:    "😀😀",
+			n:     7,
+			runes: expect{out: "😀😀", trunc: false},
+			bytes: expect{out: "😀…", trunc: true},
+		},
+	}
+
+	type truncateFunc func(string, int) (string, bool)
+
+	for _, tc := range testCases {
+		for _, fn := range []truncateFunc{TruncateInBytes, TruncateInRunes} {
+			var truncated bool
+			var out string
+
+			fnPath := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
+			fnName := path.Base(fnPath)
+			switch fnName {
+			case "notify.TruncateInRunes":
+				truncated = tc.runes.trunc
+				out = tc.runes.out
+			case "notify.TruncateInBytes":
+				truncated = tc.bytes.trunc
+				out = tc.bytes.out
+			default:
+				t.Fatalf("unknown function")
+			}
+
+			t.Run(fmt.Sprintf("%s(%s,%d)", fnName, tc.in, tc.n), func(t *testing.T) {
+				s, trunc := fn(tc.in, tc.n)
+				require.Equal(t, out, s)
+				require.Equal(t, truncated, trunc)
+			})
+		}
+	}
+}
+
+// TestTruncateInBytesFewerRunesThanBytes checks multibyte input whose byte
+// count exceeds the limit while its rune count does not.
+func TestTruncateInBytesFewerRunesThanBytes(t *testing.T) {
+	const n = 7439
+
+	for _, tc := range []struct {
+		name  string
+		char  string
+		count int
+	}{
+		{name: "two-byte runes", char: "д", count: 3720},
+		{name: "three-byte runes", char: "世", count: 2600},
+		{name: "four-byte runes", char: "😀", count: 2000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			in := strings.Repeat(tc.char, tc.count)
+			require.Greater(t, len(in), n, "the input must be over the byte limit")
+			require.Less(t, len([]rune(in)), n, "the input must hold fewer runes than the byte limit")
+
+			out, truncated := TruncateInBytes(in, n)
+			require.True(t, truncated)
+			require.LessOrEqual(t, len(out), n)
+			require.True(t, strings.HasSuffix(out, truncationMarker))
+
+			kept := strings.TrimSuffix(out, truncationMarker)
+			require.True(t, strings.HasPrefix(in, kept), "the kept text must be a prefix of the input")
+			require.Len(t, []rune(kept), (n-len(truncationMarker))/len(tc.char),
+				"the kept text must hold as many whole runes as the byte budget allows")
+		})
+	}
+}
+
+type brokenReader struct{}
+
+func (b brokenReader) Read([]byte) (int, error) {
+	return 0, fmt.Errorf("some error")
+}
+
+func TestRetrierCheck(t *testing.T) {
+	for _, tc := range []struct {
+		retrier Retrier
+		status  int
+		body    io.Reader
+
+		retry       bool
+		expectedErr string
+	}{
+		{
+			retrier: Retrier{},
+			status:  http.StatusOK,
+			body:    bytes.NewBuffer([]byte("ok")),
+
+			retry: false,
+		},
+		{
+			retrier: Retrier{},
+			status:  http.StatusNoContent,
+
+			retry: false,
+		},
+		{
+			retrier: Retrier{},
+			status:  http.StatusBadRequest,
+
+			retry:       false,
+			expectedErr: "unexpected status code 400",
+		},
+		{
+			retrier: Retrier{RetryCodes: []int{http.StatusTooManyRequests}},
+			status:  http.StatusBadRequest,
+			body:    bytes.NewBuffer([]byte("invalid request")),
+
+			retry:       false,
+			expectedErr: "unexpected status code 400: invalid request",
+		},
+		{
+			retrier: Retrier{RetryCodes: []int{http.StatusTooManyRequests}},
+			status:  http.StatusTooManyRequests,
+
+			retry:       true,
+			expectedErr: "unexpected status code 429",
+		},
+		{
+			retrier: Retrier{},
+			status:  http.StatusServiceUnavailable,
+			body:    bytes.NewBuffer([]byte("retry later")),
+
+			retry:       true,
+			expectedErr: "unexpected status code 503: retry later",
+		},
+		{
+			retrier: Retrier{},
+			status:  http.StatusBadGateway,
+			body:    &brokenReader{},
+
+			retry:       true,
+			expectedErr: "unexpected status code 502",
+		},
+		{
+			retrier: Retrier{CustomDetailsFunc: func(status int, b io.Reader) string {
+				if status != http.StatusServiceUnavailable {
+					return "invalid"
+				}
+				bs, _ := io.ReadAll(b)
+				return fmt.Sprintf("server response is %q", string(bs))
+			}},
+			status: http.StatusServiceUnavailable,
+			body:   bytes.NewBuffer([]byte("retry later")),
+
+			retry:       true,
+			expectedErr: "unexpected status code 503: server response is \"retry later\"",
+		},
+	} {
+		t.Run("", func(t *testing.T) {
+			retry, err := tc.retrier.Check(tc.status, tc.body)
+			require.Equal(t, tc.retry, retry)
+			if tc.expectedErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.EqualError(t, err, tc.expectedErr)
+		})
+	}
+}
+
+func TestGetTemplateDataWithRouteLabels(t *testing.T) {
+	tmpl, err := template.New()
+	require.NoError(t, err)
+	tmpl.ExternalURL = &url.URL{Scheme: "http", Host: "example.com"}
+
+	// A route label value containing template metacharacters: the dispatcher
+	// has already rendered route labels, so GetTemplateData must mark them
+	// rendered and the routeLabels function must return them verbatim rather
+	// than executing them a second time.
+	ctx := context.Background()
+	ctx = WithReceiverName(ctx, "test-receiver")
+	ctx = WithGroupKey(ctx, "test-key")
+	ctx = WithGroupLabels(ctx, model.LabelSet{"alertname": "Test"})
+	ctx = WithNotificationReason(ctx, ReasonFirstNotification)
+	ctx = WithRouteLabels(ctx, model.LabelSet{
+		"team": "ops",
+		"desc": "value is {{ $value }}",
+	})
+
+	data := GetTemplateData(ctx, tmpl, nil, promslog.NewNopLogger())
+
+	require.Equal(t, "ops", data.RouteLabels["team"])
+	require.Equal(t, "value is {{ $value }}", data.RouteLabels["desc"])
+
+	// The routeLabels template function returns the values verbatim.
+	got, err := tmpl.ExecuteTextString(`{{ routeLabels "team" }}|{{ routeLabels "desc" }}`, data)
+	require.NoError(t, err)
+	require.Equal(t, "ops|value is {{ $value }}", got)
+}
+
+func TestGetFailureReasonFromStatusCode(t *testing.T) {
+	for _, tc := range []struct {
+		statusCode int
+		expected   Reason
+	}{
+		{http.StatusUnauthorized, AuthErrorReason},
+		{http.StatusForbidden, AuthErrorReason},
+		{http.StatusTooManyRequests, RateLimitedReason},
+		{http.StatusBadRequest, ClientErrorReason},
+		{http.StatusNotFound, ClientErrorReason},
+		{http.StatusInternalServerError, ServerErrorReason},
+		{http.StatusServiceUnavailable, ServerErrorReason},
+		{http.StatusOK, DefaultReason},
+		{http.StatusMovedPermanently, DefaultReason},
+	} {
+		t.Run(http.StatusText(tc.statusCode), func(t *testing.T) {
+			require.Equal(t, tc.expected, GetFailureReasonFromStatusCode(tc.statusCode))
+		})
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	received := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	// A client whose clock trails the server's must still get the delay right.
+	serverNow := received.Add(time.Minute)
+
+	header := func(retryAfter, date string) http.Header {
+		h := http.Header{}
+		if retryAfter != "" {
+			h.Set("Retry-After", retryAfter)
+		}
+		if date != "" {
+			h.Set("Date", date)
+		}
+		return h
+	}
+
+	for _, tc := range []struct {
+		name     string
+		header   http.Header
+		expected time.Duration
+	}{
+		{name: "absent", header: header("", ""), expected: 0},
+		{name: "valid integer", header: header("30", ""), expected: 30 * time.Second},
+		{name: "non-integer", header: header("abc", ""), expected: 0},
+		{name: "negative", header: header("-5", ""), expected: 0},
+		{name: "zero", header: header("0", ""), expected: 0},
+		{name: "float value", header: header("1.5", ""), expected: 0},
+		{
+			name:     "date against server clock",
+			header:   header(serverNow.Add(30*time.Second).Format(http.TimeFormat), serverNow.Format(http.TimeFormat)),
+			expected: 30 * time.Second,
+		},
+		{
+			name:     "date without Date header",
+			header:   header(received.Add(30*time.Second).Format(http.TimeFormat), ""),
+			expected: 30 * time.Second,
+		},
+		{
+			name:     "date with unparseable Date header",
+			header:   header(received.Add(30*time.Second).Format(http.TimeFormat), "not a date"),
+			expected: 30 * time.Second,
+		},
+		{
+			name:     "date already elapsed",
+			header:   header(serverNow.Add(-30*time.Second).Format(http.TimeFormat), serverNow.Format(http.TimeFormat)),
+			expected: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.expected, ParseRetryAfter(tc.header, received))
+		})
+	}
+}

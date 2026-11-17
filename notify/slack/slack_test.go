@@ -1,0 +1,574 @@
+// Copyright The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package slack
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	commoncfg "github.com/prometheus/common/config"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
+	"github.com/stretchr/testify/require"
+
+	amcommoncfg "github.com/prometheus/alertmanager/config/common"
+
+	"github.com/prometheus/alertmanager/alert"
+	"github.com/prometheus/alertmanager/featurecontrol"
+	"github.com/prometheus/alertmanager/nflog"
+	"github.com/prometheus/alertmanager/nflog/nflogpb"
+	"github.com/prometheus/alertmanager/notify"
+	"github.com/prometheus/alertmanager/notify/test"
+	"github.com/prometheus/alertmanager/template"
+)
+
+func TestSlackRetry(t *testing.T) {
+	notifier, err := New(
+		&SlackConfig{
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+		},
+		test.CreateTmpl(t),
+		promslog.NewNopLogger(),
+	)
+	require.NoError(t, err)
+
+	retryCodes := append(test.DefaultRetryCodes(), http.StatusTooManyRequests)
+	for statusCode, expected := range test.RetryTests(retryCodes) {
+		actual, _ := notifier.retrier.Check(statusCode, nil)
+		require.Equal(t, expected, actual, "error on status %d", statusCode)
+	}
+}
+
+func TestSlackRedactedURL(t *testing.T) {
+	ctx, u, fn := test.GetContextWithCancelingURL()
+	defer fn()
+
+	notifier, err := New(
+		&SlackConfig{
+			APIURL:     &amcommoncfg.SecretURL{URL: u},
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+		},
+		test.CreateTmpl(t),
+		promslog.NewNopLogger(),
+	)
+	require.NoError(t, err)
+
+	test.AssertNotifyLeaksNoSecret(ctx, t, notifier, u.String())
+}
+
+func TestGettingSlackURLFromFile(t *testing.T) {
+	ctx, u, fn := test.GetContextWithCancelingURL()
+	defer fn()
+
+	f, err := os.CreateTemp(t.TempDir(), "slack_test")
+	require.NoError(t, err, "creating temp file failed")
+	_, err = f.WriteString(u.String())
+	require.NoError(t, err, "writing to temp file failed")
+
+	notifier, err := New(
+		&SlackConfig{
+			APIURLFile: f.Name(),
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+		},
+		test.CreateTmpl(t),
+		promslog.NewNopLogger(),
+	)
+	require.NoError(t, err)
+
+	test.AssertNotifyLeaksNoSecret(ctx, t, notifier, u.String())
+}
+
+func TestTrimmingSlackURLFromFile(t *testing.T) {
+	ctx, u, fn := test.GetContextWithCancelingURL()
+	defer fn()
+
+	f, err := os.CreateTemp(t.TempDir(), "slack_test_newline")
+	require.NoError(t, err, "creating temp file failed")
+	_, err = f.WriteString(u.String() + "\n\n")
+	require.NoError(t, err, "writing to temp file failed")
+
+	notifier, err := New(
+		&SlackConfig{
+			APIURLFile: f.Name(),
+			HTTPConfig: &commoncfg.HTTPClientConfig{},
+		},
+		test.CreateTmpl(t),
+		promslog.NewNopLogger(),
+	)
+	require.NoError(t, err)
+
+	test.AssertNotifyLeaksNoSecret(ctx, t, notifier, u.String())
+}
+
+func TestNotifier_Notify_WithReason(t *testing.T) {
+	tests := []struct {
+		name           string
+		statusCode     int
+		responseBody   string
+		expectedReason notify.Reason
+		expectedErr    string
+		expectedRetry  bool
+		noError        bool
+	}{
+		{
+			name:           "with a 4xx status code",
+			statusCode:     http.StatusUnauthorized,
+			expectedReason: notify.AuthErrorReason,
+			expectedRetry:  false,
+			expectedErr:    "unexpected status code 401",
+		},
+		{
+			name:           "with a 5xx status code",
+			statusCode:     http.StatusInternalServerError,
+			expectedReason: notify.ServerErrorReason,
+			expectedRetry:  true,
+			expectedErr:    "unexpected status code 500",
+		},
+		{
+			name:           "with a 3xx status code",
+			statusCode:     http.StatusTemporaryRedirect,
+			expectedReason: notify.DefaultReason,
+			expectedRetry:  false,
+			expectedErr:    "unexpected status code 307",
+		},
+		{
+			name:           "with a 1xx status code",
+			statusCode:     http.StatusSwitchingProtocols,
+			expectedReason: notify.DefaultReason,
+			expectedRetry:  false,
+			expectedErr:    "unexpected status code 101",
+		},
+		{
+			name:           "2xx response with invalid JSON",
+			statusCode:     http.StatusOK,
+			responseBody:   `{"not valid json"}`,
+			expectedReason: notify.ClientErrorReason,
+			expectedRetry:  true,
+			expectedErr:    "could not unmarshal",
+		},
+		{
+			name:           "2xx response with a JSON error",
+			statusCode:     http.StatusOK,
+			responseBody:   `{"ok":false,"error":"error_message"}`,
+			expectedReason: notify.ClientErrorReason,
+			expectedRetry:  false,
+			expectedErr:    "error response from Slack: error_message",
+		},
+		{
+			name:           "2xx response with a plaintext error",
+			statusCode:     http.StatusOK,
+			responseBody:   "no_channel",
+			expectedReason: notify.ClientErrorReason,
+			expectedRetry:  false,
+			expectedErr:    "error response from Slack: no_channel",
+		},
+		{
+			name:           "with a 429 status code",
+			statusCode:     http.StatusTooManyRequests,
+			expectedReason: notify.RateLimitedReason,
+			expectedRetry:  true,
+			expectedErr:    "unexpected status code 429",
+		},
+		{
+			name:         "successful JSON response",
+			statusCode:   http.StatusOK,
+			responseBody: `{"ok":true}`,
+			noError:      true,
+		},
+		{
+			name:         "successful plaintext response",
+			statusCode:   http.StatusOK,
+			responseBody: "ok",
+			noError:      true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apiurl, _ := url.Parse("https://slack.com/post.Message")
+			notifier, err := New(
+				&SlackConfig{
+					NotifierConfig: amcommoncfg.NotifierConfig{},
+					HTTPConfig:     &commoncfg.HTTPClientConfig{},
+					APIURL:         &amcommoncfg.SecretURL{URL: apiurl},
+					Channel:        "channelname",
+				},
+				test.CreateTmpl(t),
+				promslog.NewNopLogger(),
+			)
+			require.NoError(t, err)
+
+			notifier.postJSONFunc = func(ctx context.Context, client *http.Client, url string, body io.Reader) (*http.Response, error) {
+				resp := httptest.NewRecorder()
+				if strings.HasPrefix(tt.responseBody, "{") {
+					resp.Header().Add("Content-Type", "application/json; charset=utf-8")
+				}
+				resp.WriteHeader(tt.statusCode)
+				resp.WriteString(tt.responseBody)
+				return resp.Result(), nil
+			}
+			ctx := context.Background()
+			ctx = notify.WithGroupKey(ctx, "1")
+
+			alert1 := alert.New(model.Alert{
+				StartsAt: time.Now(),
+				EndsAt:   time.Now().Add(time.Hour),
+			}, time.Time{}, false)
+			verdict := notifier.Notify(ctx, alert1)
+			require.Equal(t, tt.expectedRetry, verdict.ShouldRetry())
+			if tt.noError {
+				require.NoError(t, verdict.Err())
+			} else {
+				require.Error(t, verdict.Err())
+				require.Equal(t, tt.expectedReason, verdict.Reason())
+				require.Contains(t, verdict.Err().Error(), tt.expectedErr)
+				require.Contains(t, verdict.Err().Error(), "channelname")
+			}
+		})
+	}
+}
+
+func TestSlackTimeout(t *testing.T) {
+	tests := map[string]struct {
+		latency time.Duration
+		timeout time.Duration
+		wantErr bool
+	}{
+		"success": {latency: 100 * time.Millisecond, timeout: 120 * time.Millisecond, wantErr: false},
+		"error":   {latency: 100 * time.Millisecond, timeout: 80 * time.Millisecond, wantErr: true},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			u, _ := url.Parse("https://slack.com/post.Message")
+			notifier, err := New(
+				&SlackConfig{
+					NotifierConfig: amcommoncfg.NotifierConfig{},
+					HTTPConfig:     &commoncfg.HTTPClientConfig{},
+					APIURL:         &amcommoncfg.SecretURL{URL: u},
+					Channel:        "channelname",
+					Timeout:        tt.timeout,
+				},
+				test.CreateTmpl(t),
+				promslog.NewNopLogger(),
+			)
+			require.NoError(t, err)
+			notifier.postJSONFunc = func(ctx context.Context, client *http.Client, url string, body io.Reader) (*http.Response, error) {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(tt.latency):
+					resp := httptest.NewRecorder()
+					resp.Header().Set("Content-Type", "application/json; charset=utf-8")
+					resp.WriteHeader(http.StatusOK)
+					resp.WriteString(`{"ok":true}`)
+
+					return resp.Result(), nil
+				}
+			}
+			ctx := context.Background()
+			ctx = notify.WithGroupKey(ctx, "1")
+
+			alrt := alert.New(model.Alert{
+				StartsAt: time.Now(),
+				EndsAt:   time.Now().Add(time.Hour),
+			}, time.Time{}, false)
+			verdict := notifier.Notify(ctx, alrt)
+			require.Equal(t, tt.wantErr, verdict.Err() != nil)
+		})
+	}
+}
+
+func TestSlackMessageField(t *testing.T) {
+	// 1. Setup a fake Slack server
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+
+		// 2. VERIFY: Top-level text exists
+		if body["text"] != "My Top Level Message" {
+			t.Errorf("Expected top-level 'text' to be 'My Top Level Message', got %v", body["text"])
+		}
+
+		// 3. VERIFY: Old attachments still exist
+		attachments, ok := body["attachments"].([]any)
+		if !ok || len(attachments) == 0 {
+			t.Errorf("Expected attachments to exist")
+		} else {
+			first := attachments[0].(map[string]any)
+			if first["title"] != "Old Attachment Title" {
+				t.Errorf("Expected attachment title 'Old Attachment Title', got %v", first["title"])
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok": true}`))
+	}))
+	defer server.Close()
+
+	// 4. Configure Notifier with BOTH new and old fields
+	u, _ := url.Parse(server.URL)
+	conf := &SlackConfig{
+		APIURL:      &amcommoncfg.SecretURL{URL: u},
+		MessageText: "My Top Level Message", // Your NEW field
+		Title:       "Old Attachment Title", // An OLD field
+		Channel:     "#test-channel",
+		HTTPConfig:  &commoncfg.HTTPClientConfig{},
+	}
+
+	tmpl, err := template.FromGlobs([]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl.ExternalURL = u
+
+	logger := slog.New(slog.DiscardHandler)
+	notifier, err := New(conf, tmpl, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	ctx = notify.WithGroupKey(ctx, "test-group-key")
+
+	if err := notifier.Notify(ctx).Err(); err != nil {
+		t.Fatal("Notify failed:", err)
+	}
+}
+
+func TestNotifier_Notify_RetryAfterDelay(t *testing.T) {
+	apiurl, _ := url.Parse("https://slack.com/post.Message")
+	notifier, err := New(
+		&SlackConfig{
+			NotifierConfig: amcommoncfg.NotifierConfig{},
+			HTTPConfig:     &commoncfg.HTTPClientConfig{},
+			APIURL:         &amcommoncfg.SecretURL{URL: apiurl},
+			Channel:        "channelname",
+		},
+		test.CreateTmpl(t),
+		promslog.NewNopLogger(),
+	)
+	require.NoError(t, err)
+
+	notifier.postJSONFunc = func(ctx context.Context, client *http.Client, url string, body io.Reader) (*http.Response, error) {
+		resp := httptest.NewRecorder()
+		resp.Header().Set("Retry-After", "1")
+		resp.WriteHeader(http.StatusTooManyRequests)
+		return resp.Result(), nil
+	}
+
+	ctx := context.Background()
+	ctx = notify.WithGroupKey(ctx, "1")
+
+	alert1 := alert.New(model.Alert{
+		StartsAt: time.Now(),
+		EndsAt:   time.Now().Add(time.Hour),
+	}, time.Time{}, false)
+
+	verdict := notifier.Notify(ctx, alert1)
+
+	require.True(t, verdict.ShouldRetry())
+	require.Error(t, verdict.Err())
+	require.Equal(t, 1*time.Second, verdict.Delay())
+}
+
+func TestSlackPostUpdatesToThread(t *testing.T) {
+	type capturedRequest struct {
+		url  string
+		body map[string]any
+	}
+
+	newTestNotifier := func(t *testing.T, conf *SlackConfig, captured *[]capturedRequest, respTs string) *Notifier {
+		t.Helper()
+		u, _ := url.Parse("https://slack.com/api/chat.postMessage")
+		conf.APIURL = &amcommoncfg.SecretURL{URL: u}
+		conf.Channel = "#test-channel"
+		conf.HTTPConfig = &commoncfg.HTTPClientConfig{}
+
+		tmpl, err := template.FromGlobs([]string{})
+		require.NoError(t, err)
+		tmpl.ExternalURL = u
+
+		notifier, err := New(conf, tmpl, slog.New(slog.DiscardHandler))
+		require.NoError(t, err)
+
+		notifier.postJSONFunc = func(ctx context.Context, client *http.Client, reqURL string, body io.Reader) (*http.Response, error) {
+			var decoded map[string]any
+			require.NoError(t, json.NewDecoder(body).Decode(&decoded))
+			*captured = append(*captured, capturedRequest{url: reqURL, body: decoded})
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok": true, "channel": "C123", "ts": "` + respTs + `"}`)),
+			}
+			return resp, nil
+		}
+		return notifier
+	}
+
+	newCtx := func(store *nflog.Store) context.Context {
+		ctx := notify.WithGroupKey(context.Background(), "test-group-key")
+		return notify.WithNflogStore(ctx, store)
+	}
+
+	t.Run("first notification posts to channel and stores thread ts", func(t *testing.T) {
+		var captured []capturedRequest
+		notifier := newTestNotifier(t, &SlackConfig{UpdateMessage: true, PostUpdatesToThread: true}, &captured, "111.222")
+		store := nflog.NewStore(nil)
+
+		require.NoError(t, notifier.Notify(newCtx(store)).Err())
+
+		require.Len(t, captured, 1)
+		require.Equal(t, "https://slack.com/api/chat.postMessage", captured[0].url)
+		require.NotContains(t, captured[0].body, "ts")
+		require.NotContains(t, captured[0].body, "thread_ts")
+
+		threadTs, _ := store.GetStr("threadTs")
+		channelId, _ := store.GetStr("channelId")
+		require.Equal(t, "111.222", threadTs)
+		require.Equal(t, "C123", channelId)
+	})
+
+	t.Run("subsequent notification updates message and posts thread reply", func(t *testing.T) {
+		var captured []capturedRequest
+		notifier := newTestNotifier(t, &SlackConfig{UpdateMessage: true, PostUpdatesToThread: true}, &captured, "999.999")
+		store := nflog.NewStore(nil)
+		store.SetStr("threadTs", "111.222")
+		store.SetStr("channelId", "C123")
+
+		require.NoError(t, notifier.Notify(newCtx(store)).Err())
+
+		require.Len(t, captured, 2)
+		require.Equal(t, "https://slack.com/api/chat.update", captured[0].url)
+		require.Equal(t, "111.222", captured[0].body["ts"])
+		require.Equal(t, "C123", captured[0].body["channel"])
+		require.NotContains(t, captured[0].body, "thread_ts")
+
+		require.Equal(t, "https://slack.com/api/chat.postMessage", captured[1].url)
+		require.Equal(t, "111.222", captured[1].body["thread_ts"])
+		require.Equal(t, "C123", captured[1].body["channel"])
+		require.NotContains(t, captured[1].body, "ts")
+
+		// The stored root message ts must not be overwritten by the responses.
+		threadTs, _ := store.GetStr("threadTs")
+		require.Equal(t, "111.222", threadTs)
+	})
+
+	t.Run("subsequent notification posts only to thread without update_message", func(t *testing.T) {
+		var captured []capturedRequest
+		notifier := newTestNotifier(t, &SlackConfig{PostUpdatesToThread: true}, &captured, "999.999")
+		store := nflog.NewStore(nil)
+		store.SetStr("threadTs", "111.222")
+		store.SetStr("channelId", "C123")
+
+		require.NoError(t, notifier.Notify(newCtx(store)).Err())
+
+		require.Len(t, captured, 1)
+		require.Equal(t, "https://slack.com/api/chat.postMessage", captured[0].url)
+		require.Equal(t, "111.222", captured[0].body["thread_ts"])
+		require.Equal(t, "C123", captured[0].body["channel"])
+		require.NotContains(t, captured[0].body, "ts")
+
+		threadTs, _ := store.GetStr("threadTs")
+		require.Equal(t, "111.222", threadTs)
+	})
+
+	t.Run("update_message alone does not post thread reply", func(t *testing.T) {
+		var captured []capturedRequest
+		notifier := newTestNotifier(t, &SlackConfig{UpdateMessage: true}, &captured, "999.999")
+		store := nflog.NewStore(nil)
+		store.SetStr("threadTs", "111.222")
+		store.SetStr("channelId", "C123")
+
+		require.NoError(t, notifier.Notify(newCtx(store)).Err())
+
+		require.Len(t, captured, 1)
+		require.Equal(t, "https://slack.com/api/chat.update", captured[0].url)
+		require.Equal(t, "111.222", captured[0].body["ts"])
+		require.NotContains(t, captured[0].body, "thread_ts")
+	})
+
+	t.Run("new firing after resolution starts a new thread", func(t *testing.T) {
+		var captured []capturedRequest
+		notifier := newTestNotifier(t, &SlackConfig{UpdateMessage: true, PostUpdatesToThread: true}, &captured, "")
+		var posted int
+		notifier.postJSONFunc = func(ctx context.Context, client *http.Client, reqURL string, body io.Reader) (*http.Response, error) {
+			var decoded map[string]any
+			require.NoError(t, json.NewDecoder(body).Decode(&decoded))
+			captured = append(captured, capturedRequest{url: reqURL, body: decoded})
+			posted++
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"ok": true, "channel": "C123", "ts": "%d.000"}`, posted))),
+			}, nil
+		}
+
+		nl, err := nflog.New(nflog.Options{Retention: time.Hour, Metrics: prometheus.NewRegistry()})
+		require.NoError(t, err)
+		recv := &nflogpb.Receiver{GroupName: "test", Integration: "slack"}
+		dedup := notify.NewDedupStage(notifier.conf, nl, recv)
+		setNotifies := notify.NewSetNotifiesStage(nl, recv, featurecontrol.NoopFlags{})
+
+		notifyGroup := func(a *alert.Alert) []capturedRequest {
+			t.Helper()
+			captured = nil
+			ctx := notify.WithGroupKey(context.Background(), "test-group-key")
+			ctx = notify.WithRepeatInterval(ctx, time.Hour)
+			ctx, alerts, err := dedup.Exec(ctx, promslog.NewNopLogger(), a)
+			require.NoError(t, err)
+			require.NoError(t, notifier.Notify(ctx, alerts...).Err())
+			_, _, err = setNotifies.Exec(ctx, promslog.NewNopLogger(), alerts...)
+			require.NoError(t, err)
+			return captured
+		}
+		labels := model.LabelSet{"alertname": "test"}
+		firing := alert.New(model.Alert{Labels: labels, StartsAt: time.Now()}, time.Now(), false)
+		resolved := alert.New(model.Alert{Labels: labels, StartsAt: time.Now(), EndsAt: time.Now().Add(-time.Minute)}, time.Now(), false)
+
+		reqs := notifyGroup(firing)
+		require.Len(t, reqs, 1)
+		require.NotContains(t, reqs[0].body, "thread_ts")
+
+		reqs = notifyGroup(resolved)
+		require.Len(t, reqs, 2)
+		require.Equal(t, "1.000", reqs[0].body["ts"])
+		require.Equal(t, "1.000", reqs[1].body["thread_ts"])
+
+		// The resolved group's thread is never posted to again.
+		reqs = notifyGroup(firing)
+		require.Len(t, reqs, 1)
+		require.Equal(t, "https://slack.com/api/chat.postMessage", reqs[0].url)
+		require.NotContains(t, reqs[0].body, "thread_ts")
+		require.NotContains(t, reqs[0].body, "ts")
+
+		reqs = notifyGroup(resolved)
+		require.Len(t, reqs, 2)
+		require.Equal(t, "4.000", reqs[0].body["ts"])
+		require.Equal(t, "4.000", reqs[1].body["thread_ts"])
+	})
+}
