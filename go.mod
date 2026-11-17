@@ -19,7 +19,7 @@ require (
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/coreos/go-systemd/v22 v22.7.0
-	github.com/emersion/go-smtp v0.25.0
+	github.com/emersion/go-smtp v0.26.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-openapi/analysis v1.0.1
 	github.com/go-openapi/errors v0.22.9
